@@ -1,786 +1,451 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, arrayUnion } from 'firebase/firestore';
-import { 
-  Wifi, Link2, Copy, File, Send, UploadCloud, 
-  Smartphone, Tablet, Monitor, CheckCircle2, XCircle, 
-  Loader2, Radio, Check, Image as ImageIcon, AlertTriangle,
-  Camera, Globe, Activity, Trash2, Download
-} from 'lucide-react';
-
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-
-// Optimized STUN Configuration for maximum traversal
-const rtcConfig = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' }
-  ]
-};
-
-const getDeviceIcon = (type) => {
-  if (type === 'tablet') return <Tablet className="w-14 h-14 text-indigo-400 drop-shadow-lg" />;
-  if (type === 'mobile') return <Smartphone className="w-14 h-14 text-indigo-400 drop-shadow-lg" />;
-  return <Monitor className="w-14 h-14 text-indigo-400 drop-shadow-lg" />;
-};
-
-const detectDevice = () => {
-  const ua = navigator.userAgent;
-  if (/(tablet|ipad|playbook|silk)|(android(?!.*mobi))/i.test(ua)) return 'tablet';
-  if (/Mobile|Android|iP(hone|od)|IEMobile|BlackBerry|Kindle|Silk-Accelerated|(hpw|web)OS|Opera M(obi|ini)/.test(ua)) return 'mobile';
-  return 'desktop';
-};
-
-const formatBytes = (bytes) => {
-  if (bytes === 0) return '0 B';
-  const k = 1024, dm = 1, sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
-};
-
-// Web-Native Haptics Wrapper
-const triggerHaptic = (type = 'light') => {
-  if (!navigator.vibrate) return;
-  try {
-    if (type === 'light') navigator.vibrate(10);
-    if (type === 'success') navigator.vibrate([10, 30, 10]);
-    if (type === 'error') navigator.vibrate([50, 100, 50]);
-  } catch (e) {}
-};
-
-export default function AirDropP2P() {
-  const [user, setUser] = useState(null);
-  const [roomId, setRoomId] = useState('');
-  const [partnerId, setPartnerId] = useState('');
-  const [connectionState, setConnectionState] = useState('idle'); 
-  const [deviceType] = useState(detectDevice());
-  const [partnerDeviceType, setPartnerDeviceType] = useState('desktop');
-  const [ping, setPing] = useState(0);
-  
-  // App Data State
-  const [syncedText, setSyncedText] = useState('');
-  const [activityFeed, setActivityFeed] = useState([]); 
-  const [transferProgress, setTransferProgress] = useState(0);
-  const [isTransferring, setIsTransferring] = useState(false);
-  const [toast, setToast] = useState(null);
-  const [isDragging, setIsDragging] = useState(false);
-
-  // WebRTC Refs
-  const pcRef = useRef(null);
-  const channelRef = useRef(null);
-  const roomRef = useRef(null);
-  const unsubscribeRoom = useRef(null);
-  const localCandidateQueue = useRef([]);
-  const remoteCandidateQueue = useRef([]);
-  const pingInterval = useRef(null);
-  const isTransferringRef = useRef(false);
-
-  // Memory & Hardware Management
-  const receivingMeta = useRef(null);
-  const receivingBuffer = useRef([]);
-  const wakeLockRef = useRef(null);
-  const dragCounter = useRef(0);
-
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (err) {
-        showToast("Auth failed. Check connection.", 'error');
-      }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>AeroDrop Peak</title>
     
-    return () => {
-      unsubscribe();
-      activityFeed.forEach(item => {
-        if(item.type === 'file' && item.url) URL.revokeObjectURL(item.url);
-      });
-      releaseWakeLock();
-    };
-  }, []);
-
-  const requestWakeLock = async () => {
-    try {
-      if ('wakeLock' in navigator && !wakeLockRef.current) {
-        wakeLockRef.current = await navigator.wakeLock.request('screen');
-      }
-    } catch (err) {
-      console.log('WakeLock error:', err);
-    }
-  };
-
-  const releaseWakeLock = () => {
-    if (wakeLockRef.current) {
-      wakeLockRef.current.release();
-      wakeLockRef.current = null;
-    }
-  };
-
-  const showToast = useCallback((msg, type = 'success') => {
-    triggerHaptic(type);
-    setToast({ msg, type });
-    setTimeout(() => setToast(null), 3500);
-  }, []);
-
-  const setupDataChannel = useCallback((channel) => {
-    channel.binaryType = 'arraybuffer';
-    // 256KB threshold for optimized web memory throughput
-    channel.bufferedAmountLowThreshold = 262144; 
+    <!-- Forced Premium Typography to override custom Android fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
     
-    channel.onopen = () => {
-      setConnectionState('connected');
-      channel.send(JSON.stringify({ type: 'handshake', device: detectDevice() }));
-      showToast('Devices paired successfully!', 'success');
-      
-      pingInterval.current = setInterval(() => {
-        if (channel.readyState === 'open') {
-          channel.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
-        }
-      }, 3000);
-    };
+    <script src="https://cdn.tailwindcss.com"></script>
     
-    channel.onclose = () => {
-      disconnectCleanup();
-      showToast('Connection disconnected', 'error');
-    };
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-    channel.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        const msg = JSON.parse(event.data);
+    <!-- Secure Module Loading -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, getDoc, onSnapshot, updateDoc, arrayUnion } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        window.fbAPI = { initializeApp, getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken, getFirestore, collection, doc, setDoc, getDoc, onSnapshot, updateDoc, arrayUnion };
+    </script>
+
+    <style>
+        * { box-sizing: border-box; font-family: 'Inter', -apple-system, sans-serif !important; -webkit-tap-highlight-color: transparent; }
+        body { background-color: #000000; color: #FFFFFF; margin: 0; padding: 0; overflow: hidden; overscroll-behavior: none; }
         
-        switch(msg.type) {
-          case 'handshake':
-            setPartnerDeviceType(msg.device);
-            break;
-          case 'ping':
-            channel.send(JSON.stringify({ type: 'pong', timestamp: msg.timestamp }));
-            break;
-          case 'pong':
-            setPing(Date.now() - msg.timestamp);
-            break;
-          case 'text':
-            setSyncedText(msg.content);
-            triggerHaptic('light');
-            break;
-          case 'link':
-            setActivityFeed(prev => [{
-              id: msg.id, type: 'link', url: msg.url, timestamp: Date.now(), direction: 'incoming'
-            }, ...prev]);
-            showToast('Received a link', 'success');
-            break;
-          case 'file-meta':
-            receivingMeta.current = msg;
-            receivingBuffer.current = [];
-            setIsTransferring(true);
-            setTransferProgress(0);
-            requestWakeLock();
-            break;
-          case 'file-end':
-            try {
-              const blob = new Blob(receivingBuffer.current, { type: receivingMeta.current.fileType });
-              const fileUrl = URL.createObjectURL(blob);
-              const isImage = receivingMeta.current.fileType.startsWith('image/');
-              
-              setActivityFeed(prev => [{
-                id: receivingMeta.current.id,
-                type: 'file',
-                name: receivingMeta.current.name,
-                size: receivingMeta.current.size,
-                fileType: receivingMeta.current.fileType,
-                url: fileUrl,
-                direction: 'incoming',
-                isImage: isImage,
-                timestamp: Date.now()
-              }, ...prev]);
-              
-              showToast(`Received: ${receivingMeta.current.name}`, 'success');
-            } catch (e) {
-              showToast("Failed to process file.", "error");
-            } finally {
-              receivingMeta.current = null;
-              receivingBuffer.current = [];
-              setIsTransferring(false);
-              setTransferProgress(0);
-              releaseWakeLock();
-            }
-            break;
-          default: break;
-        }
-      } else if (event.data instanceof ArrayBuffer) {
-        receivingBuffer.current.push(event.data);
-        if (receivingMeta.current && receivingMeta.current.size) {
-           const receivedSize = receivingBuffer.current.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-           // Throttle progress updates to avoid freezing React
-           if (receivingBuffer.current.length % 20 === 0) {
-             setTransferProgress(Math.round((receivedSize / receivingMeta.current.size) * 100));
-           }
-        }
-      }
-    };
-    
-    channelRef.current = channel;
-  }, [showToast]);
-
-  const hostConnection = async () => {
-    if (!user) return;
-    triggerHaptic('light');
-    setConnectionState('hosting');
-
-    const code = Math.floor(1000 + Math.random() * 9000).toString();
-    setRoomId(code);
-    
-    const roomDoc = doc(db, 'artifacts', appId, 'public', 'data', 'webrtc_rooms', code);
-    roomRef.current = roomDoc;
-
-    const pc = new RTCPeerConnection(rtcConfig);
-    pcRef.current = pc;
-
-    const channel = pc.createDataChannel('liquid-drop-channel');
-    setupDataChannel(channel);
-
-    pc.onicecandidate = async (event) => {
-      if (event.candidate) {
-        const candidateJson = event.candidate.toJSON();
-        try { await updateDoc(roomDoc, { callerCandidates: arrayUnion(candidateJson) }); } 
-        catch(e) { localCandidateQueue.current.push(candidateJson); }
-      }
-    };
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    await setDoc(roomDoc, {
-      offer: { type: offer.type, sdp: offer.sdp },
-      callerCandidates: [], calleeCandidates: [], createdAt: Date.now()
-    });
-    
-    while(localCandidateQueue.current.length > 0) {
-        await updateDoc(roomDoc, { callerCandidates: arrayUnion(localCandidateQueue.current.shift()) });
-    }
-
-    unsubscribeRoom.current = onSnapshot(roomDoc, async (snapshot) => {
-      const data = snapshot.data();
-      if (!data) return;
-
-      if (!pc.currentRemoteDescription && data.answer) {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-        while(remoteCandidateQueue.current.length > 0) {
-          await pc.addIceCandidate(new RTCIceCandidate(remoteCandidateQueue.current.shift()));
-        }
-      }
-
-      if (data.calleeCandidates?.length > 0) {
-        data.calleeCandidates.forEach(async (candidate) => {
-          if (pc.remoteDescription) {
-            try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
-          } else { remoteCandidateQueue.current.push(candidate); }
-        });
-      }
-    });
-  };
-
-  const joinConnection = async (e) => {
-    e.preventDefault();
-    if (!user || partnerId.length !== 4) return;
-    triggerHaptic('light');
-    setConnectionState('joining');
-
-    const code = partnerId;
-    const roomDoc = doc(db, 'artifacts', appId, 'public', 'data', 'webrtc_rooms', code);
-    roomRef.current = roomDoc;
-
-    const roomSnapshot = await getDoc(roomDoc);
-    if (!roomSnapshot.exists()) {
-      setConnectionState('idle');
-      showToast("Invalid PIN.", "error");
-      return;
-    }
-
-    const pc = new RTCPeerConnection(rtcConfig);
-    pcRef.current = pc;
-
-    pc.ondatachannel = (event) => setupDataChannel(event.channel);
-
-    pc.onicecandidate = async (event) => {
-      if (event.candidate) {
-        const candidateJson = event.candidate.toJSON();
-        try { await updateDoc(roomDoc, { calleeCandidates: arrayUnion(candidateJson) }); } 
-        catch(e) { localCandidateQueue.current.push(candidateJson); }
-      }
-    };
-
-    const offer = roomSnapshot.data().offer;
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    await updateDoc(roomDoc, { answer: { type: answer.type, sdp: answer.sdp } });
-
-    while(localCandidateQueue.current.length > 0) {
-        await updateDoc(roomDoc, { calleeCandidates: arrayUnion(localCandidateQueue.current.shift()) });
-    }
-
-    unsubscribeRoom.current = onSnapshot(roomDoc, async (snapshot) => {
-      const data = snapshot.data();
-      if (!data) return;
-      if (data.callerCandidates?.length > 0) {
-        data.callerCandidates.forEach(async (candidate) => {
-          try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
-        });
-      }
-    });
-  };
-
-  const startFileTransfer = async (file) => {
-    if (!file || !channelRef.current || channelRef.current.readyState !== 'open') return;
-
-    requestWakeLock();
-    setIsTransferring(true);
-    isTransferringRef.current = true;
-    setTransferProgress(0);
-
-    const fileId = Math.random().toString(36).substring(7);
-    const isImage = file.type.startsWith('image/');
-    
-    channelRef.current.send(JSON.stringify({ 
-      type: 'file-meta', id: fileId, name: file.name, size: file.size, fileType: file.type 
-    }));
-
-    setActivityFeed(prev => [{
-      id: fileId, type: 'file', name: file.name, size: file.size, fileType: file.type, 
-      url: URL.createObjectURL(file), direction: 'outgoing', isImage, timestamp: Date.now()
-    }, ...prev]);
-
-    // 64KB chunks: The sweet spot for web-based WebRTC throughput
-    const chunkSize = 65536; 
-    let offset = 0;
-
-    const waitForBuffer = () => new Promise(resolve => {
-      if(channelRef.current) channelRef.current.onbufferedamountlow = resolve;
-    });
-
-    try {
-      while (offset < file.size && isTransferringRef.current) {
-        if (channelRef.current.bufferedAmount > channelRef.current.bufferedAmountLowThreshold) {
-          await waitForBuffer();
-        }
-        if (!isTransferringRef.current) break;
+        .glass-card { background: #111111; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 32px; box-shadow: 0 20px 40px rgba(0,0,0,0.8); }
+        .btn-press { transition: transform 0.15s ease, opacity 0.15s ease; cursor: pointer; }
+        .btn-press:active { transform: scale(0.95); opacity: 0.8; }
         
-        const chunk = file.slice(offset, offset + chunkSize);
-        const buffer = await chunk.arrayBuffer();
-        
-        channelRef.current.send(buffer);
-        offset += buffer.byteLength;
-        
-        // UI Throttling: Update progress UI every ~1MB to keep React fast
-        if (offset % (chunkSize * 15) === 0 || offset >= file.size) {
-          setTransferProgress(Math.round((offset / file.size) * 100));
-        }
-      }
-      
-      if (isTransferringRef.current) {
-        channelRef.current.send(JSON.stringify({ type: 'file-end', id: fileId }));
-        showToast("File sent", "success");
-      }
-    } catch (error) {
-      console.error("Transfer Error", error);
-      showToast("Transfer failed", "error");
-    } finally {
-      setIsTransferring(false);
-      isTransferringRef.current = false;
-      setTransferProgress(0);
-      releaseWakeLock();
-    }
-  };
+        .fade-in { animation: fadeIn 0.4s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
 
-  const handleFileUpload = (e) => {
-    if(e.target.files.length > 0) startFileTransfer(e.target.files[0]);
-    e.target.value = ''; // reset input
-  };
-
-  const handleDragEnter = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (connectionState !== 'connected') return;
-    dragCounter.current += 1;
-    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
-      setIsDragging(true);
-    }
-  };
-
-  const handleDragLeave = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dragCounter.current -= 1;
-    if (dragCounter.current === 0) {
-      setIsDragging(false);
-    }
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    dragCounter.current = 0;
-    
-    if (connectionState !== 'connected') return;
-    
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      startFileTransfer(e.dataTransfer.files[0]);
-    }
-  };
-
-  const handleSendLink = (e) => {
-    e.preventDefault();
-    const form = e.target;
-    const urlInput = form.elements.url.value.trim();
-    if (!urlInput || !channelRef.current) return;
-
-    let finalUrl = urlInput;
-    if (!/^https?:\/\//i.test(finalUrl)) {
-      finalUrl = 'https://' + finalUrl;
-    }
-
-    const linkId = Math.random().toString(36).substring(7);
-    channelRef.current.send(JSON.stringify({ type: 'link', id: linkId, url: finalUrl }));
-    
-    setActivityFeed(prev => [{
-      id: linkId, type: 'link', url: finalUrl, timestamp: Date.now(), direction: 'outgoing'
-    }, ...prev]);
-    
-    form.reset();
-    triggerHaptic('light');
-  };
-
-  const handleTextChange = (e) => {
-    const val = e.target.value;
-    setSyncedText(val);
-    if (channelRef.current?.readyState === 'open') {
-      channelRef.current.send(JSON.stringify({ type: 'text', content: val }));
-    }
-  };
-
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(syncedText);
-    showToast("Copied to clipboard");
-  };
-
-  const clearActivityFeed = () => {
-    activityFeed.forEach(item => {
-      if(item.type === 'file' && item.url) URL.revokeObjectURL(item.url);
-    });
-    setActivityFeed([]);
-    triggerHaptic('light');
-  };
-
-  const disconnectCleanup = () => {
-    isTransferringRef.current = false;
-    if (pingInterval.current) clearInterval(pingInterval.current);
-    if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
-    if (unsubscribeRoom.current) { unsubscribeRoom.current(); unsubscribeRoom.current = null; }
-    releaseWakeLock();
-    setConnectionState('idle');
-    setRoomId('');
-    setPartnerId('');
-    setPing(0);
-    triggerHaptic('error');
-  };
-
-  return (
-    <div 
-      className="h-[100dvh] w-full bg-black text-gray-100 font-sans overflow-hidden relative selection:bg-indigo-500/30 touch-manipulation no-select"
-      onDragEnter={handleDragEnter}
-      onDragOver={(e) => e.preventDefault()}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-    >
-      
-      {/* Animated OLED Mesh Gradient Background */}
-      <div className="fixed inset-0 z-0 pointer-events-none opacity-40">
-        <div className="absolute top-[-10%] left-[-10%] w-[70vw] h-[70vw] rounded-full bg-indigo-900/30 blur-[120px] mix-blend-screen animate-blob" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[60vw] h-[60vw] rounded-full bg-blue-900/20 blur-[130px] mix-blend-screen animate-blob animation-delay-2000" />
-      </div>
-
-      {/* Global Drag Overlay */}
-      {isDragging && connectionState === 'connected' && (
-        <div className="absolute inset-0 z-[100] bg-black/60 backdrop-blur-md flex items-center justify-center border-4 border-indigo-500/50 m-4 rounded-3xl animate-in fade-in zoom-in-95 duration-200">
-          <div className="flex flex-col items-center p-10 bg-white/5 rounded-3xl border border-white/10 shadow-2xl">
-            <UploadCloud className="w-20 h-20 text-indigo-400 mb-4 animate-bounce" />
-            <h2 className="text-2xl font-bold tracking-tight text-white">Drop to Beam</h2>
-          </div>
+        ::-webkit-scrollbar { display: none; }
+        input::placeholder { color: #555555; }
+    </style>
+</head>
+<body>
+    <!-- Fallback Pre-loader in case React fails -->
+    <div id="root">
+        <div style="height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; color: white; padding: 20px; text-align: center;">
+            <div style="width: 40px; height: 40px; border: 3px solid #0A84FF; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
+            <h2 style="font-size: 20px; font-weight: 700; margin-bottom: 8px;">Loading Peak Engine</h2>
+            <p style="color: #888; font-size: 14px;">Establishing secure environment...</p>
+            <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
         </div>
-      )}
-
-      {/* Premium Toast Notification System */}
-      {toast && (
-        <div className="fixed top-safe pt-6 left-1/2 -translate-x-1/2 z-[110] animate-in slide-in-from-top-10 fade-in duration-300">
-          <div className={`px-6 py-3.5 rounded-full backdrop-blur-3xl border shadow-2xl flex items-center gap-3 ${
-            toast.type === 'error' ? 'bg-red-950/40 border-red-500/30 text-red-100' : 'bg-white/10 border-white/10 text-white'
-          }`}>
-            {toast.type === 'error' ? <AlertTriangle className="w-5 h-5 text-red-400" /> : <CheckCircle2 className="w-5 h-5 text-indigo-400" />}
-            <span className="font-semibold tracking-wide text-sm">{toast.msg}</span>
-          </div>
-        </div>
-      )}
-
-      <div className="relative z-10 h-full max-w-7xl mx-auto flex flex-col pt-safe px-4 sm:px-8 pb-4">
-        
-        {/* Header Navigation */}
-        <header className="flex justify-between items-center py-6 flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-blue-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <Wifi className="w-5 h-5 text-white" />
-            </div>
-            <h1 className="text-xl font-bold tracking-tight text-white/95">Drop<span className="text-indigo-400">Kit</span></h1>
-          </div>
-          
-          <div className="flex items-center gap-3">
-            {connectionState === 'connected' ? (
-              <div className="flex items-center bg-white/5 rounded-full border border-white/10 p-1 pr-2">
-                <div className="flex items-center gap-2 px-3 py-1">
-                  <Activity className="w-4 h-4 text-emerald-400" />
-                  <span className="text-xs font-mono text-white/60 hidden sm:inline">{ping}ms</span>
-                </div>
-                <button onClick={disconnectCleanup} className="px-4 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-full text-xs font-bold transition-colors">
-                  End
-                </button>
-              </div>
-            ) : (
-              <div className="px-4 py-2 bg-white/5 rounded-full border border-white/10 flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-                <span className="text-xs font-bold text-white/50 uppercase tracking-widest">Local</span>
-              </div>
-            )}
-          </div>
-        </header>
-
-        {/* Not Connected View */}
-        {connectionState !== 'connected' && (
-          <div className="flex-1 flex flex-col items-center justify-center max-w-sm mx-auto w-full animate-in fade-in zoom-in-95 duration-500">
-            <div className="relative flex items-center justify-center mb-12">
-              {connectionState === 'hosting' && (
-                <>
-                  <div className="absolute w-40 h-40 bg-indigo-500/20 rounded-full animate-ping opacity-75" />
-                  <div className="absolute w-56 h-56 border border-indigo-500/30 rounded-full animate-[spin_3s_linear_infinite]" />
-                </>
-              )}
-              <div className="z-10 w-32 h-32 bg-white/5 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] shadow-2xl flex items-center justify-center">
-                {getDeviceIcon(deviceType)}
-              </div>
-            </div>
-
-            {connectionState === 'idle' ? (
-              <div className="w-full space-y-6">
-                <div className="text-center mb-10">
-                  <h2 className="text-3xl font-bold tracking-tight mb-2">Connect</h2>
-                  <p className="text-white/40 text-sm font-medium">Keep both devices on the same Wi-Fi.</p>
-                </div>
-                
-                <button onClick={hostConnection} className="w-full py-4 bg-white text-black rounded-2xl font-bold text-lg hover:scale-[1.02] active:scale-[0.98] transition-all shadow-[0_0_40px_rgba(255,255,255,0.1)] flex justify-center items-center gap-3">
-                  <Radio className="w-6 h-6" /> Start Session
-                </button>
-                
-                <div className="relative flex items-center py-4">
-                  <div className="flex-grow border-t border-white/5"></div>
-                  <span className="flex-shrink-0 mx-4 text-white/20 text-xs font-bold uppercase tracking-widest">Or Join</span>
-                  <div className="flex-grow border-t border-white/5"></div>
-                </div>
-
-                <form onSubmit={joinConnection} className="flex gap-3">
-                  <input type="number" placeholder="0000" value={partnerId} onChange={(e) => setPartnerId(e.target.value.slice(0,4))}
-                    className="flex-1 bg-white/5 border border-white/10 rounded-2xl px-4 py-4 text-center text-2xl font-mono tracking-[0.5em] focus:outline-none focus:ring-2 focus:ring-indigo-500/50 backdrop-blur-xl placeholder:text-white/10 transition-all no-spinners"
-                  />
-                  <button type="submit" disabled={partnerId.length !== 4} className="px-8 bg-indigo-600 disabled:bg-white/5 disabled:text-white/20 text-white rounded-2xl font-bold text-lg transition-all active:scale-[0.98]">
-                    Join
-                  </button>
-                </form>
-              </div>
-            ) : (
-              <div className="text-center w-full animate-in slide-in-from-bottom-8">
-                <p className="text-white/40 font-bold uppercase tracking-widest text-xs mb-6">Pairing Code</p>
-                <div className="bg-white/5 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden">
-                  <div className="absolute inset-0 bg-gradient-to-br from-indigo-500/10 to-transparent" />
-                  <h2 className="text-7xl font-mono tracking-[0.2em] font-bold text-white relative z-10 ml-4 drop-shadow-lg">{roomId}</h2>
-                </div>
-                <button onClick={disconnectCleanup} className="mt-10 px-6 py-2 rounded-full bg-white/5 text-white/40 hover:text-white/80 hover:bg-white/10 transition-all font-semibold text-sm">Cancel Session</button>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Connected Interface */}
-        {connectionState === 'connected' && (
-          <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-5 min-h-0 animate-in fade-in zoom-in-95 duration-500">
-            
-            {/* Left/Top Column: Clipboard & Links */}
-            <div className="lg:col-span-5 flex flex-col gap-5 min-h-0">
-              
-              <div className="flex-1 bg-white/5 backdrop-blur-2xl border border-white/10 rounded-[2rem] p-6 flex flex-col shadow-2xl relative group">
-                <div className="flex justify-between items-center mb-4">
-                  <div className="flex items-center gap-2">
-                    <Copy className="w-4 h-4 text-indigo-400" />
-                    <h3 className="font-bold tracking-tight text-white/90">Universal Clipboard</h3>
-                  </div>
-                  <button onClick={copyToClipboard} className="text-xs bg-white/10 hover:bg-white/20 text-white font-bold px-4 py-2 rounded-full transition-all active:scale-95">
-                    Copy
-                  </button>
-                </div>
-                <textarea 
-                  value={syncedText} onChange={handleTextChange} placeholder="Type or paste text to sync instantly..."
-                  className="flex-1 w-full bg-transparent resize-none outline-none text-[15px] leading-relaxed placeholder:text-white/20 custom-scrollbar text-white/80 font-medium"
-                />
-              </div>
-
-              <div className="bg-white/5 backdrop-blur-2xl border border-white/10 rounded-[2rem] p-6 shadow-2xl flex-shrink-0">
-                <div className="flex items-center gap-2 mb-4">
-                  <Globe className="w-4 h-4 text-blue-400" />
-                  <h3 className="font-bold tracking-tight text-white/90">Beam Link</h3>
-                </div>
-                <form onSubmit={handleSendLink} className="flex gap-3">
-                  <input name="url" type="url" placeholder="https://" required
-                    className="flex-1 bg-black/40 border border-white/10 rounded-2xl px-5 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 text-white placeholder:text-white/30 font-medium transition-colors"
-                  />
-                  <button type="submit" className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3.5 rounded-2xl font-bold transition-all shadow-lg active:scale-95">
-                    Send
-                  </button>
-                </form>
-              </div>
-
-            </div>
-
-            {/* Right/Bottom Column: Files & Camera & Feed */}
-            <div className="lg:col-span-7 bg-white/5 backdrop-blur-2xl border border-white/10 rounded-[2rem] flex flex-col shadow-2xl overflow-hidden h-[55vh] lg:h-auto">
-              
-              <div className="p-3 border-b border-white/5 bg-black/20 flex gap-3 flex-shrink-0">
-                
-                <label className="flex-1 relative group cursor-pointer bg-white/5 hover:bg-white/10 border border-white/5 rounded-2xl p-5 transition-all text-center">
-                  <input type="file" onChange={handleFileUpload} disabled={isTransferring} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed" />
-                  <div className="bg-indigo-500/20 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
-                    <UploadCloud className="w-5 h-5 text-indigo-400" />
-                  </div>
-                  <span className="text-[13px] font-bold text-white/80">Send File</span>
-                </label>
-
-                <label className="flex-1 relative group cursor-pointer bg-white/5 hover:bg-white/10 border border-white/5 rounded-2xl p-5 transition-all text-center">
-                  <input type="file" accept="image/*" capture="environment" onChange={handleFileUpload} disabled={isTransferring} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed" />
-                  <div className="bg-blue-500/20 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
-                    <Camera className="w-5 h-5 text-blue-400" />
-                  </div>
-                  <span className="text-[13px] font-bold text-white/80">Take Photo</span>
-                </label>
-              </div>
-
-              {isTransferring && (
-                <div className="px-6 py-5 border-b border-white/5 bg-indigo-500/10 flex items-center gap-5">
-                  <div className="relative w-10 h-10 flex items-center justify-center flex-shrink-0">
-                    <svg className="w-full h-full transform -rotate-90 text-indigo-500/20" viewBox="0 0 36 36">
-                      <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" strokeWidth="4"/>
-                      <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" strokeDasharray={`${transferProgress}, 100`} stroke="currentColor" strokeWidth="4" className="text-indigo-400 transition-all duration-300"/>
-                    </svg>
-                    <span className="absolute text-[10px] font-bold">{transferProgress}%</span>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-bold text-white/90 truncate">{receivingMeta.current ? receivingMeta.current.name : 'Uploading...'}</p>
-                    <p className="text-xs font-medium text-indigo-300 mt-1">{receivingMeta.current ? 'Receiving' : 'Sending'} over Local Network</p>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
-                <div className="flex justify-between items-center mb-5">
-                  <h4 className="text-[11px] font-bold uppercase tracking-widest text-white/30">Activity Feed</h4>
-                  {activityFeed.length > 0 && (
-                    <button onClick={clearActivityFeed} className="text-[11px] font-bold uppercase text-white/30 hover:text-white/60 flex items-center gap-1 transition-colors"><Trash2 className="w-3 h-3"/> Clear</button>
-                  )}
-                </div>
-
-                {activityFeed.length === 0 && !isTransferring && (
-                  <div className="h-full flex flex-col items-center justify-center text-white/20 pb-10">
-                    <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-4">
-                      <Activity className="w-6 h-6 opacity-50" />
-                    </div>
-                    <p className="text-sm font-semibold">No recent activity</p>
-                  </div>
-                )}
-                
-                <div className="space-y-3">
-                  {activityFeed.map((item) => (
-                    <div key={item.id} className="group flex items-center gap-4 p-3.5 bg-white/5 hover:bg-white/10 border border-white/5 rounded-2xl transition-colors">
-                      
-                      <div className="w-12 h-12 rounded-xl flex-shrink-0 flex items-center justify-center overflow-hidden bg-black/40 border border-white/10">
-                        {item.type === 'link' ? <Globe className="w-5 h-5 text-blue-400" /> :
-                         item.isImage ? <img src={item.url} alt="preview" className="w-full h-full object-cover" /> :
-                         <File className={`w-5 h-5 ${item.direction === 'incoming' ? 'text-indigo-400' : 'text-white/40'}`} />}
-                      </div>
-                      
-                      <div className="flex-1 min-w-0">
-                        {item.type === 'link' ? (
-                          <a href={item.url} target="_blank" rel="noreferrer" className="text-sm font-bold text-blue-400 hover:text-blue-300 hover:underline truncate block transition-colors">
-                            {item.url}
-                          </a>
-                        ) : (
-                          <p className="text-sm font-bold text-white/95 truncate">{item.name}</p>
-                        )}
-                        <div className="flex items-center gap-2 mt-1.5 text-[11px] text-white/40 font-bold tracking-wide uppercase">
-                          {item.direction === 'incoming' ? <span className="text-indigo-400 flex items-center gap-1"><Download className="w-3 h-3"/> Received</span> : <span className="flex items-center gap-1"><Check className="w-3 h-3"/> Sent</span>}
-                          {item.type === 'file' && <span>• {formatBytes(item.size)}</span>}
-                        </div>
-                      </div>
-
-                      {item.direction === 'incoming' && item.type === 'file' && (
-                        <a href={item.url} download={item.name} className="px-4 py-2 bg-white text-black text-xs font-bold rounded-full shadow-lg transition-transform active:scale-95 flex-shrink-0">
-                          Save
-                        </a>
-                      )}
-                      {item.type === 'link' && (
-                        <a href={item.url} target="_blank" rel="noreferrer" className="px-4 py-2 bg-white text-black text-xs font-bold rounded-full shadow-lg transition-transform active:scale-95 flex-shrink-0">
-                          Open
-                        </a>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-
-      <style dangerouslySetInnerHTML={{__html: `
-        input[type="number"]::-webkit-inner-spin-button,
-        input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-        .no-spinners { -moz-appearance: textfield; }
-        .no-select { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
-        input, textarea { -webkit-user-select: auto; user-select: auto; }
-        .custom-scrollbar::-webkit-scrollbar { width: 5px; height: 5px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
-        @supports (padding-top: env(safe-area-inset-top)) { .pt-safe { padding-top: calc(env(safe-area-inset-top) + 0.5rem); } }
-        @supports (padding-bottom: env(safe-area-inset-bottom)) { .pb-safe { padding-bottom: calc(env(safe-area-inset-bottom) + 1rem); } }
-        
-        @keyframes blob {
-          0% { transform: translate(0px, 0px) scale(1); }
-          33% { transform: translate(30px, -50px) scale(1.1); }
-          66% { transform: translate(-20px, 20px) scale(0.9); }
-          100% { transform: translate(0px, 0px) scale(1); }
-        }
-        .animate-blob { animation: blob 20s infinite alternate cubic-bezier(0.4, 0, 0.2, 1); }
-        .animation-delay-2000 { animation-delay: 2s; }
-      `}} />
     </div>
-  );
-}
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'aerodrop-peak';
+        let app, auth, db;
+
+        // --- 100% Stable Hardcoded Icons (No Fragments) ---
+        const IconSend = ({ size = 28, className = "" }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path></svg>;
+        const IconReceive = ({ size = 28, className = "" }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>;
+        const IconWifi = ({ size = 40, className = "" }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M5 12.55a11 11 0 0 1 14.08 0"></path><path d="M1.42 9a16 16 0 0 1 21.16 0"></path><path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path><line x1="12" y1="20" x2="12.01" y2="20"></line></svg>;
+        const IconFile = ({ size = 20, className = "" }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>;
+        const IconCheck = ({ size = 20, className = "" }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="20 6 9 17 4 12"></polyline></svg>;
+
+        // --- Peak Performance WebRTC Settings ---
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        const CHUNK_SIZE = 256 * 1024; // 256KB max local throughput chunk
+        const BUFFER_LIMIT = 1024 * 1024; // 1MB Pressure threshold
+
+        function App() {
+            const [user, setUser] = useState(null);
+            const [view, setView] = useState('home'); // home, connect, transfer
+            const [role, setRole] = useState(null); // host, join
+            const [pin, setPin] = useState('');
+            const [connStatus, setConnStatus] = useState('Offline');
+            
+            const [queue, setQueue] = useState([]);
+            const [history, setHistory] = useState([]);
+            const [activeTx, setActiveTx] = useState(null); // { name, progress, dir }
+
+            const pcRef = useRef(null);
+            const dcRef = useRef(null);
+            const unsubRef = useRef(null);
+
+            const rxBuf = useRef([]);
+            const rxSize = useRef(0);
+            const rxMeta = useRef(null);
+
+            // 1. Backend Authentication Loop
+            useEffect(() => {
+                const initAuth = () => {
+                    const timer = setInterval(async () => {
+                        if (window.fbAPI) {
+                            clearInterval(timer);
+                            try {
+                                const config = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "demo" };
+                                app = window.fbAPI.initializeApp(config);
+                                auth = window.fbAPI.getAuth(app);
+                                db = window.fbAPI.getFirestore(app);
+
+                                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                                    await window.fbAPI.signInWithCustomToken(auth, __initial_auth_token);
+                                } else {
+                                    await window.fbAPI.signInAnonymously(auth);
+                                }
+                                window.fbAPI.onAuthStateChanged(auth, setUser);
+                            } catch (e) {
+                                console.error("Database connection failed", e);
+                            }
+                        }
+                    }, 100);
+                };
+                initAuth();
+                return () => { if (unsubRef.current) unsubRef.current(); };
+            }, []);
+
+            // 2. WebRTC Setup
+            const buildPC = () => {
+                const pc = new RTCPeerConnection(rtcConfig);
+                pcRef.current = pc;
+                pc.oniceconnectionstatechange = () => {
+                    if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') disconnect();
+                };
+                return pc;
+            };
+
+            const setupChannel = (dc) => {
+                dc.binaryType = 'arraybuffer';
+                dcRef.current = dc;
+                dc.onopen = () => {
+                    setView('transfer');
+                    setConnStatus('Direct Link Active');
+                    if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+                };
+                dc.onclose = disconnect;
+                dc.onmessage = handleDataMsg;
+            };
+
+            const disconnect = () => {
+                if (dcRef.current) dcRef.current.close();
+                if (pcRef.current) pcRef.current.close();
+                if (unsubRef.current) unsubRef.current();
+                pcRef.current = null; dcRef.current = null;
+                setView('home'); setRole(null); setPin(''); setActiveTx(null); setQueue([]);
+                setConnStatus('Offline');
+                if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
+            };
+
+            // 3. Signaling (The Handshake)
+            const handleHost = async () => {
+                if (!user || !db) return;
+                setView('connect'); setRole('host'); setConnStatus('Generating PIN...');
+                const code = Math.floor(100000 + Math.random() * 900000).toString();
+                setPin(code);
+
+                const pc = buildPC();
+                const dc = pc.createDataChannel('aero_data', { negotiated: false });
+                setupChannel(dc);
+
+                // Correct Firestore Pathing Rule Applied Here
+                const roomRef = window.fbAPI.doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
+
+                pc.onicecandidate = async (e) => {
+                    if (e.candidate) await window.fbAPI.updateDoc(roomRef, { caller: window.fbAPI.arrayUnion(e.candidate.toJSON()) });
+                };
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                
+                await window.fbAPI.setDoc(roomRef, { offer: { type: offer.type, sdp: offer.sdp }, caller: [], callee: [] });
+
+                unsubRef.current = window.fbAPI.onSnapshot(roomRef, async (snap) => {
+                    const data = snap.data();
+                    if (!data) return;
+                    if (!pc.currentRemoteDescription && data.answer) {
+                        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+                    }
+                    if (data.callee && data.callee.length > 0) {
+                        data.callee.forEach(async c => { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e){} });
+                    }
+                });
+            };
+
+            const handleJoin = async (codeStr) => {
+                if (!user || !db || codeStr.length !== 6) return;
+                setView('connect'); setRole('join'); setPin(codeStr); setConnStatus('Linking Devices...');
+
+                const roomRef = window.fbAPI.doc(db, 'artifacts', appId, 'public', 'data', 'rooms', codeStr);
+                
+                try {
+                    const snap = await window.fbAPI.getDoc(roomRef);
+                    if (!snap.exists()) { alert("PIN expired or invalid."); disconnect(); return; }
+
+                    const pc = buildPC();
+                    pc.ondatachannel = (e) => setupChannel(e.channel);
+                    
+                    pc.onicecandidate = async (e) => {
+                        if (e.candidate) await window.fbAPI.updateDoc(roomRef, { callee: window.fbAPI.arrayUnion(e.candidate.toJSON()) });
+                    };
+
+                    const data = snap.data();
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    
+                    await window.fbAPI.updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp } });
+
+                    unsubRef.current = window.fbAPI.onSnapshot(roomRef, (snap) => {
+                        const d = snap.data();
+                        if (d && d.caller) d.caller.forEach(async c => { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e){} });
+                    });
+                } catch(e) {
+                    alert("Network error."); disconnect();
+                }
+            };
+
+            // 4. Data Transfer (Peak Throughput)
+            const handleDataMsg = (e) => {
+                if (typeof e.data === 'string') {
+                    const meta = JSON.parse(e.data);
+                    rxMeta.current = meta; rxBuf.current = []; rxSize.current = 0;
+                    setActiveTx({ name: meta.name, progress: 0, dir: 'rx' });
+                } else {
+                    rxBuf.current.push(e.data);
+                    rxSize.current += e.data.byteLength;
+                    
+                    const meta = rxMeta.current;
+                    if (meta) {
+                        const pct = (rxSize.current / meta.size) * 100;
+                        if (Math.floor(pct) % 5 === 0 || pct >= 100) setActiveTx(p => ({ ...p, progress: pct }));
+                        if (rxSize.current === meta.size) finishReceive();
+                    }
+                }
+            };
+
+            const finishReceive = () => {
+                const meta = rxMeta.current;
+                const blob = new Blob(rxBuf.current, { type: meta.type || 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a'); a.href = url; a.download = meta.name;
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                
+                setHistory(prev => [{ name: meta.name, size: meta.size, dir: 'rx' }, ...prev]);
+                if(navigator.vibrate) navigator.vibrate([15, 30, 15]);
+                
+                setTimeout(() => setActiveTx(null), 1500);
+                rxMeta.current = null; rxBuf.current = [];
+            };
+
+            useEffect(() => {
+                if (view === 'transfer' && queue.length > 0 && !activeTx) processQueue();
+            }, [queue, view, activeTx]);
+
+            const processQueue = async () => {
+                const file = queue[0];
+                const dc = dcRef.current;
+                if (!file || !dc || dc.readyState !== 'open') return;
+
+                dc.send(JSON.stringify({ name: file.name, size: file.size, type: file.type }));
+                setActiveTx({ name: file.name, progress: 0, dir: 'tx' });
+
+                let offset = 0;
+                
+                const pumpData = async () => {
+                    if (offset >= file.size) {
+                        setHistory(prev => [{ name: file.name, size: file.size, dir: 'tx' }, ...prev]);
+                        setQueue(q => q.slice(1));
+                        if(navigator.vibrate) navigator.vibrate([15, 30, 15]);
+                        setTimeout(() => setActiveTx(null), 1500);
+                        return;
+                    }
+                    if (dc.bufferedAmount > BUFFER_LIMIT) {
+                        dc.onbufferedamountlow = () => { dc.onbufferedamountlow = null; pumpData(); };
+                        return;
+                    }
+                    
+                    const slice = file.slice(offset, offset + CHUNK_SIZE);
+                    const buf = await slice.arrayBuffer();
+                    dc.send(buf);
+                    offset += buf.byteLength;
+                    
+                    const pct = (offset / file.size) * 100;
+                    if (Math.floor(pct) % 5 === 0 || pct >= 100) setActiveTx(p => ({ ...p, progress: pct }));
+                    
+                    // Prevent blocking the main thread during massive gigabyte transfers
+                    if (offset % (CHUNK_SIZE * 10) === 0) setTimeout(pumpData, 0); else pumpData();
+                };
+                pumpData();
+            };
+
+            const handleFileSelect = (e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                    setQueue(prev => [...prev, ...Array.from(e.target.files)]);
+                    if(navigator.vibrate) navigator.vibrate(15);
+                }
+            };
+
+            const fmtBytes = (b) => { if (!b) return '0 B'; const k = 1024, s = ['B', 'KB', 'MB', 'GB']; const i = Math.floor(Math.log(b) / Math.log(k)); return parseFloat((b / Math.pow(k, i)).toFixed(1)) + ' ' + s[i]; };
+
+            // 5. Render UI
+            return (
+                <div className="flex flex-col h-full w-full max-w-xl mx-auto px-5 py-10 font-sans">
+                    
+                    {/* Header */}
+                    <div className="flex items-center justify-between mb-8 shrink-0">
+                        <h1 className="text-2xl font-extrabold tracking-tight">AeroDrop</h1>
+                        <div className="flex items-center gap-2 bg-[#1C1C1E] border border-[rgba(255,255,255,0.1)] px-3 py-1.5 rounded-full">
+                            <div className={`w-2.5 h-2.5 rounded-full ${view === 'transfer' ? 'bg-[#30D158] shadow-[0_0_8px_rgba(48,209,88,0.8)]' : view === 'connect' ? 'bg-[#FFD60A] animate-pulse' : 'bg-[#8E8E93]'}`}></div>
+                            <span className="text-[11px] font-bold uppercase tracking-widest text-[#EBEBF5]">{connStatus}</span>
+                        </div>
+                    </div>
+
+                    {/* Main Workspace */}
+                    <div className="flex-1 flex flex-col justify-center">
+                        
+                        {view === 'home' && (
+                            <div className="flex flex-col gap-6 fade-in w-full">
+                                {!user ? (
+                                    <div className="glass-card p-10 flex flex-col items-center justify-center text-center h-[400px]">
+                                        <div className="w-10 h-10 border-4 border-[#0A84FF] border-t-transparent rounded-full animate-spin mb-6"></div>
+                                        <h2 className="text-xl font-bold mb-2">Connecting to Secure Relay</h2>
+                                        <p className="text-[#8E8E93] text-sm">Please wait...</p>
+                                    </div>
+                                ) : (
+                                    <>
+                                        <div className="flex-1 bg-[#141415] border border-[rgba(255,255,255,0.08)] rounded-[32px] p-6 flex flex-col gap-6 shadow-[0_20px_40px_rgba(0,0,0,0.5)]">
+                                            {/* Big Send Button */}
+                                            <button onClick={handleHost} className="btn-press flex-1 bg-[#0A84FF] rounded-[24px] flex flex-col items-center justify-center p-8 text-white shadow-[0_10px_20px_rgba(10,132,255,0.3)]">
+                                                <div className="bg-white/20 p-4 rounded-full mb-4"><IconSend size={36} /></div>
+                                                <h2 className="text-2xl font-bold mb-1">Send Files</h2>
+                                                <p className="text-white/70 text-sm font-medium">Generate PIN</p>
+                                            </button>
+
+                                            {/* Big Receive Input */}
+                                            <div className="flex-1 bg-[#1C1C1E] border border-[rgba(255,255,255,0.05)] rounded-[24px] flex flex-col items-center justify-center p-8">
+                                                <div className="bg-[#30D158]/10 text-[#30D158] p-4 rounded-full mb-4"><IconReceive size={36} /></div>
+                                                <h2 className="text-2xl font-bold mb-4">Receive Files</h2>
+                                                <input 
+                                                    type="text" placeholder="Enter PIN" maxLength="6"
+                                                    className="w-full max-w-[200px] bg-[#000] border border-[rgba(255,255,255,0.15)] py-4 text-center text-2xl tracking-[0.3em] rounded-xl focus:outline-none focus:border-[#30D158] text-white font-mono transition-colors"
+                                                    onChange={e => { const v = e.target.value.replace(/\D/g, ''); e.target.value = v; if (v.length === 6) handleJoin(v); }}
+                                                />
+                                            </div>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                        {view === 'connect' && (
+                            <div className="glass-card p-10 flex flex-col items-center justify-center text-center fade-in h-[450px]">
+                                <div className="text-[#0A84FF] mb-8 animate-pulse"><IconWifi size={64} /></div>
+                                <h2 className="text-3xl font-bold mb-3">{role === 'host' ? 'Ready to Pair' : 'Linking Devices'}</h2>
+                                
+                                {role === 'host' && (
+                                    <>
+                                        <p className="text-[#8E8E93] text-sm mb-8 font-medium">Enter this PIN on your other device.</p>
+                                        <div className="bg-[#000] border border-[rgba(255,255,255,0.1)] px-10 py-6 rounded-2xl w-full mb-8">
+                                            <span className="text-5xl tracking-[0.3em] font-bold text-[#0A84FF] ml-3 font-mono">{pin}</span>
+                                        </div>
+                                    </>
+                                )}
+                                
+                                <button onClick={disconnect} className="btn-press text-[#8E8E93] font-bold bg-[#222] px-8 py-3 rounded-full hover:text-white">Cancel</button>
+                            </div>
+                        )}
+
+                        {view === 'transfer' && (
+                            <div className="flex flex-col h-full gap-5 fade-in">
+                                
+                                {/* Active Action Banner */}
+                                {activeTx && (
+                                    <div className="bg-[#1C1C1E] border border-[rgba(255,255,255,0.1)] rounded-2xl p-5 shrink-0 flex flex-col gap-3 shadow-lg">
+                                        <div className="flex justify-between items-center">
+                                            <div className="flex items-center gap-3 overflow-hidden">
+                                                <div className="w-10 h-10 rounded-full bg-[#0A84FF]/20 text-[#0A84FF] flex items-center justify-center shrink-0">
+                                                    {activeTx.progress === 100 ? <IconCheck size={20} /> : activeTx.dir === 'tx' ? <IconSend size={18} /> : <IconReceive size={18} />}
+                                                </div>
+                                                <div className="min-w-0">
+                                                    <p className="text-[10px] font-bold text-[#8E8E93] uppercase tracking-widest mb-0.5">{activeTx.dir === 'tx' ? 'Sending' : 'Receiving'}</p>
+                                                    <p className="text-sm font-bold text-white truncate max-w-[200px]">{activeTx.name}</p>
+                                                </div>
+                                            </div>
+                                            <span className="text-[#0A84FF] font-bold font-mono">{Math.floor(activeTx.progress)}%</span>
+                                        </div>
+                                        <div className="w-full h-1.5 bg-black rounded-full overflow-hidden">
+                                            <div className="h-full bg-[#0A84FF] transition-all duration-200" style={{ width: `${activeTx.progress}%` }}></div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Main Persistent Dropzone */}
+                                <div className={`glass-card flex-1 min-h-[250px] relative overflow-hidden flex flex-col items-center justify-center border-2 border-dashed border-[rgba(255,255,255,0.1)] transition-all ${activeTx && activeTx.progress < 100 ? 'opacity-40 pointer-events-none' : 'hover:bg-[#0A84FF]/5 hover:border-[#0A84FF]/40'}`}>
+                                    <input type="file" multiple onChange={handleFileSelect} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
+                                    <div className="w-20 h-20 rounded-full bg-[#0A84FF] text-white flex items-center justify-center mb-5 shadow-[0_5px_15px_rgba(10,132,255,0.4)]">
+                                        <IconSend size={36} />
+                                    </div>
+                                    <h3 className="text-3xl font-bold mb-2">Tap to Send</h3>
+                                    <p className="text-[#8E8E93] font-medium text-sm">Select photos or documents</p>
+                                </div>
+
+                                {/* History / Queue Layout */}
+                                <div className="glass-card p-5 shrink-0 h-[220px] flex flex-col">
+                                    <h4 className="text-[10px] font-bold text-[#8E8E93] uppercase tracking-widest mb-3">Session Activity</h4>
+                                    <div className="flex-1 overflow-y-auto space-y-2 pr-2">
+                                        {queue.map((f, i) => (
+                                            <div key={`q-${i}`} className="bg-[#222] rounded-xl p-3 flex justify-between items-center opacity-70">
+                                                <div className="flex items-center gap-3 overflow-hidden"><IconFile size={16} className="text-gray-500 shrink-0"/><span className="text-sm font-semibold truncate text-white">{f.name}</span></div>
+                                                <span className="text-xs text-[#8E8E93] font-mono shrink-0 ml-3">Queued</span>
+                                            </div>
+                                        ))}
+                                        {history.map((h, i) => (
+                                            <div key={`h-${i}`} className="bg-black/60 rounded-xl p-3 flex justify-between items-center border border-[rgba(255,255,255,0.05)]">
+                                                <div className="flex items-center gap-3 overflow-hidden">
+                                                    <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${h.dir === 'tx' ? 'bg-[#0A84FF]/10 text-[#0A84FF]' : 'bg-[#30D158]/10 text-[#30D158]'}`}>
+                                                        {h.dir === 'tx' ? <IconSend size={14} /> : <IconReceive size={14} />}
+                                                    </div>
+                                                    <span className="text-sm font-medium truncate text-white">{h.name}</span>
+                                                </div>
+                                                <span className="text-[11px] text-[#8E8E93] font-mono font-bold shrink-0 ml-3">{fmtBytes(h.size)}</span>
+                                            </div>
+                                        ))}
+                                        {queue.length === 0 && history.length === 0 && (
+                                            <div className="h-full flex items-center justify-center text-[#555] text-sm font-medium">No activity yet.</div>
+                                        )}
+                                    </div>
+                                </div>
+                                
+                                <button onClick={disconnect} className="btn-press bg-[#FF453A]/10 text-[#FF453A] font-bold text-sm py-4 rounded-2xl w-full border border-[#FF453A]/20">End Session</button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
+
+```
